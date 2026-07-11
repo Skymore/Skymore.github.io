@@ -372,10 +372,10 @@
 <h2 id="intro"><span data-lang="zh">一、30 秒项目介绍</span><span data-lang="en">1. 30-Second Pitch</span></h2>
 
 <blockquote data-lang="zh">
-RoomTalk 是一个实时 AI 协作平台，核心是共享房间和沙盒化 Code Agent workspace。RoomTalk 在 Fly.io 上作为 control plane，负责身份、权限、持久化 turn、usage/cost、对象存储和 sandbox lifecycle；每个 Code Agent 房间在 E2B 中拥有隔离的 execution plane，通过可复用 JSONL daemon 运行 Coco（自研 CLI coding agent），也支持用户连接自己的 Codex 订阅后通过 Codex CLI 或 app-server 在房间里工作。浏览器里可以直接查看和编辑文件、审阅 Git diff、写行级 review comment、使用 PTY terminal、打开 dev-server preview，并把静态产物发布成不依赖 sandbox 生命周期的稳定 URL。普通聊天仍支持多 Provider AI streaming、私有媒体、Redis/PostgreSQL 组合存储和移动端恢复。
+RoomTalk 是一个实时 AI 协作平台。多人可以在同一个房间聊天，也可以让 Coco 或 Codex 在房间绑定的共享 workspace 中修改代码、运行测试和启动应用。RoomTalk 服务端负责判断谁能操作、保存消息与工具记录、统计用量，并管理 sandbox；模型生成的命令全部在每个房间独立的 E2B sandbox 中执行，不进入生产服务。用户可以在浏览器里查看文件和 Git diff、使用 Terminal、预览应用，并把 review comment 交给 Agent 继续修改。发布后的静态网页单独存入对象存储，因此 sandbox 暂停后链接仍然有效。
 </blockquote>
 <blockquote data-lang="en">
-RoomTalk is a realtime AI collaboration platform centered on shared rooms and sandboxed code-agent workspaces. A Fly.io control plane owns identity, permissions, durable turns, usage/cost, object storage, and sandbox lifecycle; each code-agent room gets an isolated E2B execution plane whose reusable JSONL daemon can run Coco, our self-built CLI coding agent, or Codex through a user's connected Codex subscription via CLI/app-server adapters. In the browser, users can edit files, review Git diffs, attach line-level comments, use a PTY terminal, open dev-server previews, and publish static artifacts to stable URLs independent of sandbox lifetime. Regular chat still includes multi-provider AI streaming, private media, Redis/PostgreSQL composite storage, and mobile recovery.
+RoomTalk is a realtime AI collaboration platform where people can chat in a shared room and ask Coco or Codex to modify code, run tests, and start applications in the room's shared workspace. The RoomTalk server decides who may act, persists messages and tool records, tracks usage, and manages sandbox lifecycle. Model-generated commands run only inside an isolated E2B sandbox for that room, never inside the production service. Users can inspect files and Git diffs, use a terminal, preview the application, and send line-level review comments back to the agent. Published static sites live in object storage, so their URLs remain available after the sandbox pauses.
 </blockquote>
 
 <p data-lang="zh">面试官听完会根据兴趣追问，你控制节奏，引导到你最熟的方向。</p>
@@ -394,8 +394,8 @@ RoomTalk is a realtime AI collaboration platform centered on shared rooms and sa
                            │ authenticated HTTPS / Socket.IO
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │ RoomTalk control plane / Node 24 + Express                         │
-│ identity · room access · turn state · ordering · usage/cost        │
-│ sandbox lifecycle · scoped tokens · static publish                 │
+│ decides who may act · records messages/tools · manages sandbox     │
+│ tracks usage/cost · issues short-lived access · publishes sites    │
 ├──────────────────────┬──────────────────────┬───────────────────────┤
 │ CompositeRoomStore   │ Chat AI runtime      │ S3 / Tigris          │
 │ PostgreSQL + Redis   │ provider clients     │ media + artifacts    │
@@ -403,7 +403,7 @@ RoomTalk is a realtime AI collaboration platform centered on shared rooms and sa
                                    │ lifecycle + JSONL protocol
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │ Per-room E2B execution plane                                       │
-│ reusable daemon → Coco (in-house CLI) | Codex (user subscription)  │
+│ runs untrusted commands → Coco (in-house CLI) | Codex              │
 │ /workspace → Git · files · PTY · processes · dev-server previews   │
 │ roomtalk CLI → context broker · model gateway · site publishing    │
 └─────────────────────────────────────────────────────────────────────┘</div>
@@ -502,65 +502,66 @@ Files never pass through our server. The client requests a temporary upload URL 
 
 <h3 id="arch-agent"><span data-lang="zh">5. Code Agent — Control Plane / Execution Plane</span><span data-lang="en">5. Code Agent — Control Plane / Execution Plane</span></h3>
 
-<p data-lang="zh">Code Agent 房间不是“后端替模型执行几个 Shell 命令”。RoomTalk 只做 control plane；不可信代码、文件和进程全部留在 E2B execution plane：</p>
-<p data-lang="en">A code-agent room is not “the backend running a few shell commands for the model.” RoomTalk is strictly the control plane; untrusted code, files, and processes stay in the E2B execution plane:</p>
+<p data-lang="zh">这里把系统拆成两部分：<strong>RoomTalk 决定谁可以做什么</strong>，<strong>E2B 真正执行命令</strong>。这样生产服务可以管理房间和持久数据，却不需要运行模型生成的不可信代码。</p>
+<p data-lang="en">The system is split into two responsibilities: <strong>RoomTalk decides who may do what</strong>, while <strong>E2B actually runs commands</strong>. The production service can manage rooms and durable data without executing model-generated code.</p>
 
 <table data-lang="zh">
   <thead><tr><th>层</th><th>负责</th><th>不负责</th></tr></thead>
   <tbody>
-    <tr><td>Browser</td><td>聊天、workspace UI、流式渲染、review draft</td><td>E2B/provider secret、持久化顺序</td></tr>
-    <tr><td>RoomTalk</td><td>身份、房间权限、turn 编排、message position、usage/cost、scoped token、lifecycle</td><td>在 Fly 进程执行用户命令</td></tr>
-    <tr><td>E2B</td><td><code>/workspace</code>、Git、PTY、进程、dev server、Agent daemon</td><td>成员权限、持久消息、公开 URL 所有权</td></tr>
-    <tr><td>Coco</td><td>自研 CLI coding agent；推理与原生工具循环</td><td>RoomTalk 数据库和基础设施凭据</td></tr>
-    <tr><td>Codex</td><td>用户自己的 Codex 订阅；CLI/app-server session/thread</td><td>其他成员的订阅凭据和 RoomTalk secret</td></tr>
+    <tr><td>Browser</td><td>展示聊天、文件、diff、Terminal 和预览</td><td>不持有 E2B、模型或数据库密钥</td></tr>
+    <tr><td>RoomTalk</td><td>验证成员与权限，保存事件，管理 sandbox 和发布内容</td><td>不执行模型生成的命令</td></tr>
+    <tr><td>E2B</td><td>保存 workspace，运行 Git、Shell、PTY 和 dev server</td><td>不决定谁是房间成员</td></tr>
+    <tr><td>Coco / Codex</td><td>决定下一步并调用读文件、改代码、运行命令等工具</td><td>不直接访问 RoomTalk 数据库和生产密钥</td></tr>
   </tbody>
 </table>
 <table data-lang="en">
   <thead><tr><th>Layer</th><th>Owns</th><th>Does Not Own</th></tr></thead>
   <tbody>
-    <tr><td>Browser</td><td>Chat, workspace UI, streamed rendering, review drafts</td><td>E2B/provider secrets, persistence ordering</td></tr>
-    <tr><td>RoomTalk</td><td>Identity, room access, turn orchestration, message positions, usage/cost, scoped tokens, lifecycle</td><td>Executing user commands inside the Fly process</td></tr>
-    <tr><td>E2B</td><td><code>/workspace</code>, Git, PTY, processes, dev servers, agent daemon</td><td>Membership, durable messages, public URL ownership</td></tr>
-    <tr><td>Coco</td><td>In-house CLI coding agent; reasoning and native tool loop</td><td>RoomTalk database and infrastructure credentials</td></tr>
-    <tr><td>Codex</td><td>The user's own Codex subscription; CLI/app-server session/thread state</td><td>Other members' subscription credentials and RoomTalk secrets</td></tr>
+    <tr><td>Browser</td><td>Displays chat, files, diffs, terminal, and previews</td><td>Does not hold E2B, model-provider, or database secrets</td></tr>
+    <tr><td>RoomTalk</td><td>Checks membership and permissions, persists events, manages sandboxes and publishing</td><td>Does not execute model-generated commands</td></tr>
+    <tr><td>E2B</td><td>Stores the workspace and runs Git, shell, PTY, and dev servers</td><td>Does not decide room membership</td></tr>
+    <tr><td>Coco / Codex</td><td>Choose the next action and call tools to read, edit, or run code</td><td>Do not directly access RoomTalk databases or production secrets</td></tr>
   </tbody>
 </table>
 
 <blockquote data-lang="zh">
-我把这个系统设计成共享 cloud code-agent room，而不是 remote shell widget。RoomTalk 控制身份、权限、持久 turn 和 sandbox；E2B 执行不可信代码；自研 Coco CLI agent 和使用成员个人订阅的 Codex 负责推理与工具循环。三个层之间通过版本化 JSONL 协议和 scoped capability 连接，所以每层可以独立替换和测试。
+一句话概括：RoomTalk 是控制层，负责“谁能做什么”和“发生了什么”；E2B 是执行层，负责“真正运行代码”；Coco/Codex 负责“下一步做什么”。三者通过明确事件协议连接，因此安全边界、持久化和 Agent 实现可以分别测试。
 </blockquote>
 <blockquote data-lang="en">
-I designed it as a shared cloud code-agent room, not a remote-shell widget. RoomTalk controls identity, permissions, durable turns, and sandbox lifecycle; E2B executes untrusted code; our self-built Coco CLI agent and Codex running on each member's connected subscription own reasoning and tool loops. The layers communicate through a versioned JSONL protocol and scoped capabilities, so each layer can be replaced and tested independently.
+In one sentence: RoomTalk is the control layer that decides who may act and records what happened; E2B is the execution layer that runs code; Coco or Codex decides what to do next. A clear event protocol connects the three, so security, persistence, and agent behavior can be tested independently.
 </blockquote>
 
 <h3 id="arch-security"><span data-lang="zh">6. 权限、Context 与 Scoped Token</span><span data-lang="en">6. Permissions, Context, and Scoped Tokens</span></h3>
 
+<p data-lang="zh">可以把它理解成给 Agent 三把临时钥匙，而且每把钥匙只能开一扇门：读取房间历史、调用指定模型、发布静态网页。即使一把钥匙泄露，也不能拿它做另外两件事。</p>
+<p data-lang="en">Think of this as giving the agent three temporary keys, each opening only one door: read room history, call the selected model, or publish a static site. Leaking one key does not grant the other two capabilities.</p>
+
 <ul data-lang="zh">
-  <li><strong>四种模式</strong>：Plan、Edit、Approve for me、Full access。Plan 的 Shell 由 OS mount namespace 强制只读，不依赖字符串命令白名单。</li>
-  <li><strong>Model gateway</strong>：每个 turn 签发绑定 room/client/turn/provider/model/budget 的短期 token；provider key 不进入浏览器，也不作为 prompt 内容。</li>
-  <li><strong>Room context broker</strong>：不把整个房间历史塞进 system prompt；Agent 通过 Unix socket 上的 <code>roomtalk room history/search/delta/message</code> 按需读取有界 projection。</li>
-  <li><strong>Static publish</strong>：可写模式拿到独立 publish token；文件从 E2B 通过 presigned PUT 直传 Tigris，Fly 只验证 metadata 并原子切换 manifest。</li>
+  <li><strong>四种模式</strong>：Plan 只能读取；Edit 可以修改；另外两种模式控制命令是否需要人工批准。Plan 的只读限制由操作系统保证，而不是猜测某条 Shell 命令是否安全。</li>
+  <li><strong>模型钥匙</strong>：只允许本轮调用选定的 provider/model，并限制预算；真实 provider key 不进入浏览器或 prompt。</li>
+  <li><strong>历史钥匙</strong>：Agent 不会自动拿到整个房间，只能通过 <code>roomtalk room history/search/delta/message</code> 按需读取经过过滤的结果。</li>
+  <li><strong>发布钥匙</strong>：只允许可写模式发布当前房间的文件；上传完成后由服务端验证并切换站点版本。</li>
 </ul>
 <ul data-lang="en">
-  <li><strong>Four modes</strong>: Plan, Edit, Approve for me, and Full access. Plan shell writes are blocked by the OS mount namespace, not a string command allowlist.</li>
-  <li><strong>Model gateway</strong>: each turn receives a short-lived token bound to room/client/turn/provider/model/budget; provider keys never enter the browser or prompt.</li>
-  <li><strong>Room-context broker</strong>: full room history is not injected into every system prompt. The agent reads bounded projections on demand through <code>roomtalk room history/search/delta/message</code> over a Unix socket.</li>
-  <li><strong>Static publishing</strong>: writable modes receive a separate publish token. E2B uploads bytes directly to Tigris through presigned PUTs; Fly verifies metadata and atomically swaps the manifest.</li>
+  <li><strong>Four modes</strong>: Plan is read-only, Edit can modify files, and the other modes control whether commands require approval. The OS enforces Plan's read-only boundary instead of guessing whether a shell string is safe.</li>
+  <li><strong>Model key</strong>: permits only the selected provider/model for this turn and enforces a budget. Real provider keys never enter the browser or prompt.</li>
+  <li><strong>History key</strong>: the agent does not automatically receive the whole room. It requests filtered results on demand through <code>roomtalk room history/search/delta/message</code>.</li>
+  <li><strong>Publish key</strong>: writable modes may publish files owned by the current room. The server verifies uploads before switching the visible site version.</li>
 </ul>
 
 <div class="card warn" data-lang="zh">
   <h4>追问：为什么不用一个万能 token？</h4>
-  <p>因为 context read、model spend 和 public publish 的风险完全不同。拆成独立、短期、绑定 turn 的 capability 后，泄露时 blast radius 有边界，服务端也能分别校验 mode、room ownership、provider/model 和预算。</p>
+  <p>读取历史、花钱调用模型、公开发布网页是三种完全不同的权限。如果共用一个 token，任何一处泄露都同时开放三种能力。拆成三把短期钥匙后，历史钥匙不能花模型预算，模型钥匙不能发布网页，服务端也能分别检查房间、本轮模式、模型和预算。</p>
 </div>
 <div class="card warn" data-lang="en">
   <h4>Follow-up: Why not issue one universal token?</h4>
-  <p>Context reads, model spending, and public publishing have different risk profiles. Separate short-lived, turn-bound capabilities bound the blast radius and let the server independently enforce mode, room ownership, provider/model selection, and budget.</p>
+  <p>Reading history, spending money on a model, and publishing a public site are three different permissions. One shared token would expose all three if any single path leaked it. With three short-lived keys, the history key cannot spend model budget, the model key cannot publish a site, and the server can check room, mode, model, and budget separately.</p>
 </div>
 
 <h3 id="arch-workspace"><span data-lang="zh">7. 浏览器 Workspace 与持久 Artifact</span><span data-lang="en">7. Browser Workspace and Durable Artifacts</span></h3>
 
-<p data-lang="zh">同一个房间里，聊天 transcript 和 workspace 不是两个割裂产品。用户可以从 Agent 的工具事件直接进入对应文件、diff、terminal 或 artifact：</p>
-<p data-lang="en">The room transcript and workspace are not separate products. Users can move directly from an agent tool event into the related file, diff, terminal, preview, or artifact:</p>
+<p data-lang="zh">典型流程是：Agent 修改 <code>src/app.ts</code> → 用户打开 Git diff → 在第 42 行留言“这里没有处理 null” → 这条结构化评论随下一轮 prompt 交回 Agent。聊天、代码结果和 review 因此形成一个闭环，而不是三个独立页面。</p>
+<p data-lang="en">A typical flow is: the agent edits <code>src/app.ts</code> → the user opens the Git diff → comments “null is not handled here” on line 42 → that structured comment is attached to the next prompt. Chat, code output, and review form one loop instead of three disconnected products.</p>
 
 <ul data-lang="zh">
   <li>文件树/search/create/rename/delete、源码编辑、Markdown/图片/音视频 preview；</li>
@@ -590,22 +591,37 @@ I designed it as a shared cloud code-agent room, not a remote-shell widget. Room
 <p data-lang="zh"><strong>问题</strong>：Agent 要读写文件、安装依赖、运行测试和启动服务，但这些命令不能进入 Fly 应用进程；同时房间成员、消息、权限、计费和恢复又必须由 RoomTalk 统一管理。</p>
 <p data-lang="en"><strong>Problem</strong>: The agent must edit files, install dependencies, run tests, and start services, but none of that can execute in the Fly application process. Room membership, messages, permissions, billing, and recovery still need one RoomTalk source of truth.</p>
 
-<p data-lang="zh"><strong>方案</strong>：拆成 control plane 与 execution plane。每个房间绑定一个 E2B sandbox；RoomTalk 的 <code>CodeAgentSessionService</code> 解析本轮 mode/backend、创建 durable turn、签发 scoped capability，再把版本化 JSONL request 发给沙盒 daemon。daemon 可以路由到自研 Coco CLI agent，也可以使用当前成员通过 device authorization 连接的 Codex 订阅启动 Codex CLI 或 app-server。</p>
-<p data-lang="en"><strong>Solution</strong>: Split control and execution planes. Each room binds to one E2B sandbox. <code>CodeAgentSessionService</code> resolves mode/backend, creates a durable turn, issues scoped capabilities, and sends a versioned JSONL request to the sandbox daemon. The daemon can dispatch to the self-built Coco CLI agent or launch Codex CLI/app-server with the current member's subscription connected through device authorization.</p>
+<p data-lang="zh"><strong>方案</strong>：一次请求按下面五步完成。先讲清这条链路，再把前半段称为 control plane、后半段称为 execution plane：</p>
+<p data-lang="en"><strong>Solution</strong>: One request follows five steps. The first half is the control plane; the second half is the execution plane:</p>
 
-<div class="diagram">Browser ──authenticated socket──▶ RoomTalk control plane
-                                      │
-                                      │ room + turn + scoped env
-                                      ▼
-                                E2B JSONL daemon
-                                ├─ Coco: self-built CLI agent
-                                └─ Codex: user's subscription via CLI/app-server
-                                      │
-                                      ▼
-                              /workspace + Git + PTY</div>
+<ol data-lang="zh">
+  <li>用户通过已认证的 Socket.IO 连接发送 prompt；</li>
+  <li>RoomTalk 检查房间成员和本轮权限，并先创建可恢复的 turn 记录；</li>
+  <li>RoomTalk 启动或恢复该房间的 E2B，只授予本轮需要的临时能力；</li>
+  <li>沙盒 daemon 把请求交给 Coco 或 Codex，所有命令都在 <code>/workspace</code> 执行；</li>
+  <li>文本、工具调用和结果按真实顺序返回，RoomTalk 一边保存一边广播给房间成员。</li>
+</ol>
+<ol data-lang="en">
+  <li>The user sends a prompt over an authenticated Socket.IO connection;</li>
+  <li>RoomTalk checks membership and permissions, then creates a recoverable turn record;</li>
+  <li>RoomTalk starts or resumes the room's E2B sandbox and grants only short-lived access needed by this turn;</li>
+  <li>The sandbox daemon routes the request to Coco or Codex, and every command runs in <code>/workspace</code>;</li>
+  <li>Text and tool events return in execution order while RoomTalk persists and broadcasts them.</li>
+</ol>
 
-<blockquote data-lang="zh">最重要的不是“用了 E2B”，而是把 ownership 划清楚：RoomTalk 永远不执行不可信命令，E2B 永远不决定房间权限，Agent 永远不拿数据库或 provider secret。</blockquote>
-<blockquote data-lang="en">The important part is not merely “using E2B.” It is the ownership boundary: RoomTalk never executes untrusted commands, E2B never decides room permissions, and the agent never receives database or provider secrets.</blockquote>
+<div class="diagram">User prompt
+    │ authenticated socket
+    ▼
+RoomTalk ── check access ── save turn ── resume sandbox
+    │ short-lived access for this turn
+    ▼
+E2B daemon ── Coco or Codex ── /workspace
+    │ ordered text and tool events
+    ▼
+RoomTalk ── persist ── broadcast to the room</div>
+
+<blockquote data-lang="zh">最关键的边界是：RoomTalk 判断“谁可以做什么”，E2B 负责“运行代码”，Agent 决定“下一步做什么”。生产服务不运行模型命令，沙盒不决定房间权限，Agent 也拿不到数据库和模型供应商密钥。</blockquote>
+<blockquote data-lang="en">The key boundary is simple: RoomTalk decides who may act, E2B runs code, and the agent chooses the next action. The production service does not run model commands, the sandbox does not decide room access, and the agent never receives database or provider secrets.</blockquote>
 
 <h3 id="ch-agent-order"><span data-lang="zh">难点 2：AI 文本与工具事件的真实顺序持久化</span><span data-lang="en">Challenge 2: Persisting the True Order of AI Text and Tool Events</span></h3>
 
@@ -620,71 +636,91 @@ I designed it as a shared cloud code-agent room, not a remote-shell widget. Room
    ▼              ▼                    ▼              ▼
 AI segment A   message N+1         message N+2    AI segment B</div>
 
-<div class="card warn" data-lang="zh"><h4>追问：为什么不能前端按 timestamp 重排？</h4><p>因为文本 chunk 的工具边界已经丢失，前端无法知道整段 AI 文本中哪句话属于哪个 tool result 之后。修复必须发生在最先知道真实执行顺序的 Engine/runner 层，并由服务端 position 持久化。</p></div>
-<div class="card warn" data-lang="en"><h4>Follow-up: Why not sort by timestamp in the client?</h4><p>Because the tool boundary inside the accumulated text has already been lost. The client cannot know which sentence belongs after which tool result. The fix must start where execution order is known — engine/runner — and be persisted by server positions.</p></div>
+<div class="card warn" data-lang="zh"><h4>追问：为什么不能前端按 timestamp 重排？</h4><p>真实顺序是“AI A：我先检查目录” → Glob → 结果为空 → “AI B：目录是空的”。旧实现却把 A 和 B 合并成一条不可拆的 AI 消息，然后才保存 Glob。前端最多把整条 AI 消息移到工具前或工具后，无法把 Glob 插回 A 和 B 中间，因为这个切分位置已经丢了。若保存每个 chunk 的序号，本质上也已经是在修改 runner/服务端协议，而不是 timestamp 排序。正确做法是在 Engine/runner 仍知道边界时发出有序事件，再由服务端 <code>position</code> 保存。</p></div>
+<div class="card warn" data-lang="en"><h4>Follow-up: Why not sort by timestamp in the client?</h4><p>The real order is “AI A: I will inspect the directory” → Glob → empty result → “AI B: the directory is empty.” The old path merged A and B into one indivisible assistant message and stored Glob afterward. The client can move that whole message before or after the tool, but it cannot insert Glob between A and B because the split point is gone. Persisting sequence numbers for every chunk would already be a runner/server protocol fix, not timestamp sorting. The engine and runner must emit boundaries while they still know them, and the server must persist that order as <code>position</code>.</p></div>
 
 <h3 id="ch-agent-context"><span data-lang="zh">难点 3：共享房间上下文与最小权限同时成立</span><span data-lang="en">Challenge 3: Shared Room Context with Least Privilege</span></h3>
 
 <p data-lang="zh"><strong>问题</strong>：Agent 需要知道前几轮讨论和其他成员的消息，但把完整 transcript 与长期 token 注入 prompt 会增加 context 成本、泄露内部字段，也让 Plan 模式变相获得网络能力。</p>
 <p data-lang="en"><strong>Problem</strong>: The agent needs prior discussion and other members' messages, but injecting a full transcript and long-lived token into every prompt increases context cost, leaks internal fields, and can accidentally grant network capability in Plan mode.</p>
 
-<p data-lang="zh"><strong>方案</strong>：每轮创建本地 Unix socket broker。Agent 只看到 <code>roomtalk</code> CLI，可以按需 history/delta/search/message；真实 upstream URL/token 由 runner 保管。服务端再次校验 room/client/turn，并只投影安全字段。Model 与 publish 另用独立 token。</p>
-<p data-lang="en"><strong>Solution</strong>: Start a local Unix-socket broker per turn. The agent only sees the <code>roomtalk</code> CLI and fetches history/delta/search/message on demand; the runner keeps the upstream URL/token. The server revalidates room/client/turn and projects safe fields only. Model and publish capabilities use separate tokens.</p>
+<p data-lang="zh"><strong>方案</strong>：不把数据库 token 或整段历史交给模型。Agent 需要上下文时调用沙盒内的 <code>roomtalk</code> CLI；CLI 通过本轮专用的本地 Unix socket 找到可信 runner，再由 runner 请求 RoomTalk。服务端重新检查房间、成员和 turn，只返回允许模型看到的消息字段。</p>
+<p data-lang="en"><strong>Solution</strong>: Do not give the model a database token or the full transcript. When the agent needs context, it calls the sandbox-local <code>roomtalk</code> CLI. That CLI reaches the trusted runner through a Unix socket created only for this turn, and the runner asks RoomTalk. The server rechecks room, member, and turn, then returns only fields the model is allowed to see.</p>
+
+<div class="diagram">Agent
+  │ roomtalk CLI: history / search
+  ▼
+per-turn local Unix socket
+  ▼
+trusted runner
+  │ authenticated request
+  ▼
+RoomTalk ── recheck access ── filter fields ── return messages</div>
 
 <pre><code class="language-bash">roomtalk room history --limit 20 --json
 roomtalk room search "deployment failure" --json
 roomtalk site list --json</code></pre>
 
-<p data-lang="zh">Plan Shell 使用 bubblewrap 只读 mount namespace，并关闭直接 IP 网络，只放行本轮 broker socket。这样任意 <code>python</code>、重定向或恶意 shell 组合都无法写 workspace，而不是依赖维护不完整的“安全命令列表”。</p>
-<p data-lang="en">Plan shell uses a bubblewrap read-only mount namespace, blocks direct IP networking, and permits only the turn broker socket. Arbitrary Python, redirection, or shell composition cannot write the workspace; security does not depend on maintaining an incomplete “safe command” list.</p>
+<p data-lang="zh">这就是前面“三把临时钥匙”中的历史钥匙；调用模型和发布网页分别使用另外两把，不能互相替代。Plan 模式还把 workspace 挂载为只读并阻断直接 IP 网络，只保留这个本地 socket，所以 Agent 可以查房间历史，却不能借机访问任意网络或修改文件。</p>
+<p data-lang="en">This is the history key from the earlier “three temporary keys” model. Model calls and site publishing use separate, non-interchangeable keys. Plan mode also mounts the workspace read-only and blocks direct IP networking while allowing this local socket, so the agent can query room history without gaining arbitrary network or write access.</p>
 
-<h3 id="ch-agent-workspace"><span data-lang="zh">难点 4：让 Workspace 可检查、可审阅，而不绕过 Agent</span><span data-lang="en">Challenge 4: Making the Workspace Inspectable and Reviewable Without Bypassing the Agent</span></h3>
+<h3 id="ch-agent-workspace"><span data-lang="zh">难点 4：让 Workspace 可检查、可审阅，同时不绕过 RoomTalk 权限</span><span data-lang="en">Challenge 4: Making the Workspace Reviewable Without Bypassing RoomTalk Authorization</span></h3>
 
-<p data-lang="zh"><strong>问题</strong>：只显示 tool timeline 不足以审查真实结果；但如果浏览器直接连 E2B，又会绕过 RoomTalk 的身份与路径权限。文件、diff、terminal 和 preview 还各有不同的传输与状态模型。</p>
-<p data-lang="en"><strong>Problem</strong>: A tool timeline is not enough to review the actual result. Letting the browser connect directly to E2B would bypass RoomTalk identity and path authorization. Files, diffs, terminals, and previews also require different transport and state models.</p>
+<p data-lang="zh"><strong>问题</strong>：工具时间线只能告诉用户“Write 成功”，却不能证明到底改了什么。浏览器如果直接连接 E2B，就必须拿到 E2B 凭据，也会绕过 RoomTalk 对成员、房间和文件路径的检查。</p>
+<p data-lang="en"><strong>Problem</strong>: A tool timeline can say “Write succeeded,” but it cannot show what actually changed. A direct browser-to-E2B connection would require E2B credentials in the browser and bypass RoomTalk checks for member, room, and file path.</p>
 
-<p data-lang="zh"><strong>方案</strong>：所有 workspace 操作走已注册 socket 的 server broker。普通文件和 diff 用 request/ack snapshot；PTY 与 preview automation 用 session + delta event；大文件、图片和视频走受控 asset route。Git baseline 和 refs 提供可重复 diff，review comment 作为结构化 context 回到下一轮 Agent。</p>
-<p data-lang="en"><strong>Solution</strong>: Broker every workspace operation through authenticated server sockets. Files and diffs use request/ack snapshots; PTY and preview automation use sessions plus delta events; large files and media use controlled asset routes. Git baselines and refs make diffs reproducible, while review comments return to the next agent turn as structured context.</p>
+<p data-lang="zh"><strong>方案</strong>：浏览器始终请求 RoomTalk；RoomTalk 验证当前成员、房间和目标路径后，再代表用户访问 E2B。审阅闭环是：Agent 修改文件 → 用户查看 diff → 在具体行留言 → 下一轮把评论连同文件位置交给 Agent。不同内容的数据形态不同，因此传输方式也不同：</p>
+<p data-lang="en"><strong>Solution</strong>: The browser always asks RoomTalk. RoomTalk verifies the member, room, and target path before accessing E2B on the user's behalf. The review loop is: agent edits a file → user inspects the diff → user comments on a line → the next turn gives that comment and file location back to the agent. Different surfaces carry different kinds of data, so they use different transports:</p>
 
-<table data-lang="zh"><thead><tr><th>Surface</th><th>传输模型</th><th>关键保护</th></tr></thead><tbody>
-  <tr><td>Files / Diff</td><td>Socket request + bounded snapshot</td><td>room access、workspace path、size/truncation</td></tr>
-  <tr><td>PTY Terminal</td><td>长期 session + byte delta</td><td>session ownership、input batching、bounded tail</td></tr>
-  <tr><td>Browser Preview</td><td>server-managed preview session</td><td>目标解析、viewport、生命周期、截图/录屏</td></tr>
-  <tr><td>Artifacts</td><td>对象存储 manifest</td><td>room ownership、slug、MIME、版本化</td></tr>
+<div class="diagram">Browser ── authenticated request ──▶ RoomTalk ── checked SDK call ──▶ E2B
+   ▲                                  │
+   └── file / diff / terminal delta / preview result ──────────────────┘
+
+Agent edit → Git diff → line comment → next agent prompt</div>
+
+<table data-lang="zh"><thead><tr><th>Surface</th><th>数据特点</th><th>怎么传</th><th>为什么</th></tr></thead><tbody>
+  <tr><td>Files / Diff</td><td>一次即可返回的有限结果</td><td>请求后返回有大小上限的完整内容</td><td>一次请求就能安全拿到当前结果</td></tr>
+  <tr><td>PTY Terminal</td><td>持续、双向的字节流</td><td>长期 session + 增量字节</td><td>不能每次按键或输出都重传整个终端</td></tr>
+  <tr><td>Browser Preview</td><td>持续运行的应用和浏览器状态</td><td>服务端管理 preview session</td><td>需要跟踪端口、viewport、截图和生命周期</td></tr>
+  <tr><td>Artifacts</td><td>必须在 sandbox 停止后继续存在</td><td>对象存储中的版本记录</td><td>pause 或替换 sandbox 后 URL 仍然有效</td></tr>
 </tbody></table>
-<table data-lang="en"><thead><tr><th>Surface</th><th>Transport</th><th>Key Protection</th></tr></thead><tbody>
-  <tr><td>Files / Diff</td><td>Socket request + bounded snapshot</td><td>Room access, workspace path, size/truncation</td></tr>
-  <tr><td>PTY Terminal</td><td>Long-lived session + byte deltas</td><td>Session ownership, input batching, bounded tail</td></tr>
-  <tr><td>Browser Preview</td><td>Server-managed preview session</td><td>Target resolution, viewport, lifecycle, capture</td></tr>
-  <tr><td>Artifacts</td><td>Object-storage manifest</td><td>Room ownership, slug, MIME, versioning</td></tr>
+<table data-lang="en"><thead><tr><th>Surface</th><th>Data Shape</th><th>Transport</th><th>Why</th></tr></thead><tbody>
+  <tr><td>Files / Diff</td><td>A finite result available now</td><td>Request followed by size-bounded full content</td><td>One request can safely return the current result</td></tr>
+  <tr><td>PTY Terminal</td><td>A continuous two-way byte stream</td><td>Owned session plus byte deltas</td><td>Resending the whole terminal on every key or output would be wasteful</td></tr>
+  <tr><td>Browser Preview</td><td>A running app and browser state</td><td>Server-managed preview session</td><td>Port, viewport, capture, and lifecycle must be tracked</td></tr>
+  <tr><td>Artifacts</td><td>Must survive the sandbox</td><td>Version record in object storage</td><td>The URL stays valid after pause or sandbox replacement</td></tr>
 </tbody></table>
 
 <h3 id="ch-agent-lifecycle"><span data-lang="zh">难点 5：长任务、Daemon 与 Sandbox 生命周期</span><span data-lang="en">Challenge 5: Long Tasks, Daemon, and Sandbox Lifecycle</span></h3>
 
-<p data-lang="zh"><strong>问题</strong>：每轮启动 runner 会重复冷启动；后台服务和 terminal 需要跨工具调用存活；E2B idle timeout、Fly 重启和丢失的 <code>turn_released</code> 事件又可能留下旧 daemon 或让房间卡在 running。</p>
-<p data-lang="en"><strong>Problem</strong>: Starting a runner per turn repeats cold-start cost. Background services and terminals must survive across tool calls. E2B idle timeout, Fly restarts, and a lost <code>turn_released</code> event can leave stale daemons or a room stuck in `running`.</p>
+<p data-lang="zh"><strong>问题</strong>：这里有三种容易混淆的生命周期。<strong>Turn</strong> 是一条用户请求；<strong>daemon</strong> 是沙盒里复用的 Agent worker，会执行多轮；<strong>sandbox</strong> 是保存 workspace 和后台进程的房间环境，可以暂停和恢复。如果每轮都重建后两者，冷启动慢，Terminal 和后台应用也无法延续；如果无限复用，又可能留下旧进程或 running 状态。</p>
+<p data-lang="en"><strong>Problem</strong>: Three lifetimes are easy to confuse. A <strong>turn</strong> is one user request. A <strong>daemon</strong> is the reusable agent worker inside the sandbox and handles many turns. A <strong>sandbox</strong> is the room environment holding the workspace and background processes; it can pause and resume. Recreating the latter two for every turn is slow and loses terminal/background state, while careless reuse can leave stale processes or a stuck running state.</p>
 
-<p data-lang="zh"><strong>方案</strong>：</p>
-<p data-lang="en"><strong>Solution</strong>:</p>
+<div class="diagram">Sandbox: room workspace and background processes
+└── Daemon: reusable agent worker
+    ├── Turn 1: inspect files
+    ├── Turn 2: edit code
+    └── Turn 3: run tests</div>
+
+<p data-lang="zh"><strong>方案</strong>：正常路径优先复用，失败路径必须有明确回收：</p>
+<p data-lang="en"><strong>Solution</strong>: Reuse on the normal path, but make cleanup explicit on failure paths:</p>
 <ul data-lang="zh">
-  <li>每个 sandbox 一个可复用 daemon，串行执行多个 turn；</li>
-  <li>启动按 sandbox 加锁，并在新 daemon 前清理 stale runner/Codex child；</li>
-  <li>active turn 延长 TTL，完成后缩短为 idle；默认 5 分钟 pause + keep memory + autoResume；</li>
-  <li>SIGTERM/SIGINT 调用 <code>shutdownAll()</code>，回收当前 Fly 进程拥有的 daemon；</li>
-  <li>等待 <code>turn_released</code> 有上限，信号丢失也能结束 room running 状态；</li>
-  <li>固定 artifact 升级时 export archive → 新 sandbox → import → Git init → 原子换 sandbox ID。</li>
+  <li>一个 sandbox 复用一个 daemon；会修改 workspace 的 turn 逐个执行，后来的请求进入队列；</li>
+  <li>有活动 turn 时延长 sandbox 存活时间；空闲五分钟后 pause，需要时 autoResume；</li>
+  <li>daemon 启动加锁，并先清理旧 worker；等待结束信号有超时，信号丢失也不会永远卡在 running；</li>
+  <li>Fly 进程退出时调用 <code>shutdownAll()</code> 回收自己启动的 daemon；</li>
+  <li>运行环境升级时先导出 workspace，再导入新 sandbox，成功后才切换 sandbox ID。</li>
 </ul>
 <ul data-lang="en">
-  <li>One reusable daemon per sandbox executes multiple turns serially;</li>
-  <li>Startup is locked by sandbox and removes stale runner/Codex children before replacement;</li>
-  <li>Active turns extend TTL; completion returns to idle. Default lifecycle is five-minute pause + keep memory + autoResume;</li>
-  <li>SIGTERM/SIGINT invokes <code>shutdownAll()</code> to reclaim daemons owned by the Fly process;</li>
-  <li><code>turn_released</code> waits are bounded so a lost signal cannot leave the room running forever;</li>
-  <li>Pinned artifact upgrades export an archive, create/import/init a new sandbox, and atomically swap sandbox IDs.</li>
+  <li>One sandbox reuses one daemon. Turns that modify the workspace run one at a time, and later requests queue;</li>
+  <li>An active turn extends sandbox lifetime; after five idle minutes it pauses and later auto-resumes;</li>
+  <li>Daemon startup is locked and cleans up an old worker first. Release waits time out so a lost signal cannot leave the room running forever;</li>
+  <li>When Fly exits, <code>shutdownAll()</code> reclaims daemons started by that server process;</li>
+  <li>Runtime upgrades export the workspace and import it into a new sandbox before switching the stored sandbox ID.</li>
 </ul>
 
-<div class="card warn" data-lang="zh"><h4>追问：为什么 daemon registry 只放内存？</h4><p>Registry 保存的是当前 Node 进程持有的 stdin/stdout handle，不能直接持久化。RoomTalk 通过启动清理、健康检查和进程退出回收解决 ownership；房间和 sandbox identity 仍在 durable store。以后若 E2B 提供稳定 command reconnect handle，再持久化可重连 metadata。</p></div>
-<div class="card warn" data-lang="en"><h4>Follow-up: Why keep the daemon registry in memory?</h4><p>The registry contains live stdin/stdout handles owned by the current Node process, which cannot simply be serialized. Startup cleanup, health checks, and process-exit reclamation manage ownership, while room and sandbox identity remain durable. Persist reconnectable metadata later if E2B exposes stable command handles.</p></div>
+<div class="card warn" data-lang="zh"><h4>追问：为什么 daemon registry 只放内存？</h4><p>它保存的是当前 Node 进程正在使用的 stdin/stdout 管道句柄，而不是业务数据。这种操作系统资源不能写进数据库后由另一个进程直接恢复。数据库只保存 room ID、sandbox ID 等可持久信息；服务重启后根据这些 ID 重新连接 sandbox，并检查、清理或重启 daemon。</p></div>
+<div class="card warn" data-lang="en"><h4>Follow-up: Why keep the daemon registry in memory?</h4><p>It stores live stdin/stdout pipe handles used by the current Node process, not business data. Those operating-system resources cannot be serialized into a database and reopened by another process. The durable store keeps reconnectable facts such as room ID and sandbox ID; after restart, the server reconnects to the sandbox and checks, cleans up, or restarts the daemon.</p></div>
 
 <h3 style="color:var(--cyan);border-bottom:1px solid var(--border);padding-bottom:6px;margin-top:36px" data-lang="zh">前端篇</h3>
 <h3 style="color:var(--cyan);border-bottom:1px solid var(--border);padding-bottom:6px;margin-top:36px" data-lang="en">Frontend</h3>
@@ -1658,8 +1694,8 @@ Tests are layered by failure boundary: Python covers runner/daemon protocols, No
   <div class="star-grid">
     <div class="star-label s">Situation</div><div class="star-val">RoomTalk 已支持 AI chat，但模型不能安全地读写项目、运行命令，也没有多人可检查的 workspace 或可靠的长任务生命周期。</div>
     <div class="star-label t">Task</div><div class="star-val">在不把不可信执行放进 Fly 服务、也不重写 Coco/Codex 工具循环的前提下，构建生产可用的共享 cloud code-agent room。</div>
-    <div class="star-label a">Action</div><div class="star-val">设计 RoomTalk control plane + E2B execution plane；实现版本化 JSONL daemon，接入自研 Coco CLI agent 和用户自己的 Codex 订阅，加入四种权限模式、scoped model/context/publish capability、按 turn 持久化与 queue/steer/interrupt；在前端加入 files、Git diff/review、PTY、browser preview 和 artifacts。</div>
-    <div class="star-label r">Result</div><div class="star-val">同一房间可以持续完成代码任务并在刷新后保留可审计 transcript；sandbox 可 pause/autoResume，artifact URL 独立于 sandbox 存活；Node/Vitest/Playwright/E2B smoke 覆盖关键边界。</div>
+    <div class="star-label a">Action</div><div class="star-val">把权限和持久化留在 RoomTalk，把命令执行放入每个房间独立的 E2B；用可复用 daemon 接入 Coco 和 Codex，并保证 AI 文本与工具事件按执行顺序保存。随后加入 Plan/Edit 权限、按需房间历史、静态发布，以及浏览器中的文件、diff、Terminal 和 preview。</div>
+    <div class="star-label r">Result</div><div class="star-val">多人可以在同一房间完成、检查和继续代码任务；刷新后仍能审计完整过程，sandbox 可以暂停恢复，发布后的网页不依赖 sandbox 存活，并由 Node、Vitest、Playwright 和 E2B smoke 覆盖关键边界。</div>
   </div>
 </div>
 <div class="card" data-lang="en">
@@ -1667,8 +1703,8 @@ Tests are layered by failure boundary: Python covers runner/daemon protocols, No
   <div class="star-grid">
     <div class="star-label s">Situation</div><div class="star-val">RoomTalk supported AI chat, but models could not safely edit projects or run commands, and users had no shared inspectable workspace or reliable long-task lifecycle.</div>
     <div class="star-label t">Task</div><div class="star-val">Build a production-ready shared cloud code-agent room without executing untrusted work on Fly or reimplementing Coco/Codex tool loops.</div>
-    <div class="star-label a">Action</div><div class="star-val">Designed a RoomTalk control plane and E2B execution plane; implemented a versioned JSONL daemon integrating our self-built Coco CLI agent and users' own Codex subscriptions, four permission modes, scoped model/context/publish capabilities, durable turn ordering, queue/steer/interrupt controls, plus files, Git diff/review, PTY, browser preview, and artifact UI.</div>
-    <div class="star-label r">Result</div><div class="star-val">A room can carry out sustained coding tasks with an auditable transcript that survives refresh. Sandboxes pause/auto-resume, artifact URLs outlive sandboxes, and Node/Vitest/Playwright/E2B smoke tests cover the critical boundaries.</div>
+    <div class="star-label a">Action</div><div class="star-val">Kept authorization and persistence in RoomTalk while moving command execution into a room-scoped E2B sandbox. Integrated Coco and Codex through a reusable daemon and preserved AI text and tool events in execution order. Then added Plan/Edit permissions, on-demand room history, static publishing, and browser files, diffs, terminal, and previews.</div>
+    <div class="star-label r">Result</div><div class="star-val">Multiple people can complete, inspect, and continue coding tasks in one room. The full process remains auditable after refresh, sandboxes pause and resume, published pages outlive sandboxes, and Node, Vitest, Playwright, and E2B smoke tests cover the critical boundaries.</div>
   </div>
 </div>
 
@@ -1738,47 +1774,47 @@ Tests are layered by failure boundary: Python covers runner/daemon protocols, No
 
 <details data-lang="zh">
   <summary>为什么用 E2B，而不是在 Fly 容器里直接跑 Docker 或 Shell？</summary>
-  <div class="answer">Fly 进程拥有数据库、Redis、对象存储和用户 session 等生产权限，不应该同时执行模型生成的不可信命令。E2B 提供独立生命周期、文件系统、进程和网络边界。RoomTalk 只通过窄协议控制 sandbox，即使 Agent 命令失控，也不会直接进入 control plane。</div>
+  <div class="answer">Fly 上的 RoomTalk 服务持有数据库、Redis、对象存储和用户 session 等生产权限。若它同时执行模型生成的 Shell，命令出错或被恶意 prompt 操纵时就可能接触生产数据。E2B 把文件、进程和网络放进独立环境；RoomTalk 只发送受控请求，所以 sandbox 里的故障不会直接进入生产服务。</div>
 </details>
 <details data-lang="en">
   <summary>Why E2B instead of running Docker or shell directly in the Fly container?</summary>
-  <div class="answer">The Fly process owns production database, Redis, object-storage, and user-session privileges, so it must not also execute model-generated commands. E2B provides an independent filesystem, process, network, and lifecycle boundary. RoomTalk controls it through a narrow protocol, keeping failures out of the control plane.</div>
+  <div class="answer">The RoomTalk service on Fly holds production database, Redis, object-storage, and user-session privileges. If it also ran model-generated shell commands, a mistake or malicious prompt could reach production data. E2B places files, processes, and networking in a separate environment; RoomTalk sends only controlled requests, so sandbox failures do not directly enter the production service.</div>
 </details>
 
 <details data-lang="zh">
   <summary>为什么需要 sandbox daemon，而不是每轮启动一次 runner？</summary>
-  <div class="answer">每轮进程适合 MVP，但会重复加载 Python/Agent runtime，也很难拥有 terminal、后台服务和 backend thread 等跨 turn 状态。一个 sandbox 一个 daemon 可以复用执行环境，同时仍由 RoomTalk 保证同房间只跑一个 mutating turn。代价是必须处理 stale process、health check、shutdown ownership 和丢失 release signal。</div>
+  <div class="answer">每轮重启 runner 都要重新加载 Agent runtime，而且 Terminal、后台服务和 Agent session 很难跨轮保留。一个 sandbox 复用一个 daemon 可以保留这些状态；RoomTalk 仍保证同一时间只有一轮修改共享 workspace。代价是必须做健康检查，并在启动、超时和服务退出时清理旧进程。</div>
 </details>
 <details data-lang="en">
   <summary>Why use a sandbox daemon instead of starting one runner per turn?</summary>
-  <div class="answer">Per-turn processes are useful for an MVP, but repeatedly load the runtime and cannot naturally own terminals, background services, or backend thread state across turns. One daemon per sandbox reuses the environment while RoomTalk still serializes mutating turns. The tradeoff is explicit stale-process cleanup, health checks, shutdown ownership, and lost-release handling.</div>
+  <div class="answer">Restarting the runner for every turn repeatedly loads the agent runtime and makes it difficult to preserve terminals, background services, and agent sessions. Reusing one daemon per sandbox keeps that state, while RoomTalk still allows only one turn at a time to modify the shared workspace. The tradeoff is health checking and explicit cleanup during startup, timeout, and server shutdown.</div>
 </details>
 
 <details data-lang="zh">
   <summary>多个成员同时给 Agent 发消息，怎么避免同时修改 workspace？</summary>
-  <div class="answer">房间有一个 active-turn guard，真正执行的 mutating turn 串行化。后续 prompt 持久化为 queue，可以编辑、取消或提升为 steer。这样聊天仍是多人实时的，但共享文件系统不会被两个 Agent turn 并发修改。每个 turn 还持久化实际 mode/backend，retry 不会回退到默认权限。</div>
+  <div class="answer">每个房间同一时间只允许一个会修改文件的 Agent turn。其他成员的新 prompt 会先保存到队列，可以编辑或取消；若是对当前任务的补充，也可以作为 steering 信息交给正在运行的 Agent。这样聊天仍是多人实时的，但不会有两个 Agent 同时写同一份 workspace。每轮使用的 mode 和 backend 也会保存，retry 不会掉回默认设置。</div>
 </details>
 <details data-lang="en">
   <summary>How do you prevent multiple room members from modifying the workspace concurrently?</summary>
-  <div class="answer">A room-level active-turn guard serializes mutating agent work. Later prompts become durable queue entries that can be edited, canceled, or promoted into steering input. Chat remains realtime and multi-user, while the shared filesystem never has two agent turns writing concurrently. Each turn persists its resolved mode/backend so retry cannot fall back to default permissions.</div>
+  <div class="answer">Each room allows only one agent turn at a time to modify files. New prompts from other members are saved in a queue and can be edited or canceled; a clarification can instead steer the active agent. Chat remains realtime and multi-user, but two agents never write the same workspace concurrently. The selected mode and backend are saved on each turn so retry does not fall back to defaults.</div>
 </details>
 
 <details data-lang="zh">
   <summary>Agent 如何看到历史，又不会拿到整个数据库或长期 token？</summary>
-  <div class="answer">Runner 为本轮创建 Unix socket broker，只把 <code>roomtalk</code> CLI 暴露给 Agent。CLI 的 history/search/delta/message 请求由 broker 带 scoped token 转发；服务端重新校验 room/client/turn，并只返回安全 projection。Model spend 与 static publish 使用另外两种 token，不能互相替代。</div>
+  <div class="answer">Agent 需要历史时调用沙盒里的 <code>roomtalk</code> CLI。CLI 通过本轮专用的本地 socket 请求可信 runner，再由 runner 请求 RoomTalk；服务端重新检查房间、成员和 turn，只返回过滤后的消息。Agent 看不到数据库 token。模型调用和静态发布还使用另外两把临时钥匙，三者不能互换。</div>
 </details>
 <details data-lang="en">
   <summary>How can the agent read history without receiving database access or a long-lived token?</summary>
-  <div class="answer">The runner creates a per-turn Unix-socket broker and exposes only the <code>roomtalk</code> CLI. The broker forwards history/search/delta/message requests with a scoped token; the server revalidates room/client/turn and returns a safe projection. Model spending and static publishing use separate non-interchangeable tokens.</div>
+  <div class="answer">When the agent needs history, it calls the sandbox-local <code>roomtalk</code> CLI. The CLI reaches the trusted runner through a local socket created for this turn, and the runner asks RoomTalk. The server rechecks room, member, and turn and returns filtered messages; the agent never sees a database token. Model calls and static publishing use two other temporary, non-interchangeable keys.</div>
 </details>
 
 <details data-lang="zh">
   <summary>Sandbox 暂停或升级后，文件和网页会怎样？</summary>
-  <div class="answer">默认 idle 五分钟后 E2B pause，并启用 keep-memory + autoResume，所以同一个 sandbox 恢复时文件和进程内存可以继续。固定 artifact 版本变化时，RoomTalk 会 bounded export/import workspace archive 后原子替换 sandbox。公开静态站点单独存入 Tigris manifest/version，不依赖 sandbox 存活。</div>
+  <div class="answer">要分三种情况：空闲暂停时仍是同一个 sandbox，autoResume 后继续使用原 workspace；运行环境版本升级时会创建新 sandbox，RoomTalk 先迁移 workspace，成功后再切换；已经发布的静态网页存放在独立对象存储中，所以无论 sandbox 暂停还是被替换，公开 URL 都继续有效。</div>
 </details>
 <details data-lang="en">
   <summary>What happens to files and published pages when a sandbox pauses or upgrades?</summary>
-  <div class="answer">The default E2B policy pauses after five idle minutes with keep-memory and autoResume, so the same sandbox can continue. When the pinned artifact changes, RoomTalk performs a bounded workspace archive export/import and atomically swaps sandboxes. Public static sites live in separate Tigris manifests/versions and do not depend on sandbox lifetime.</div>
+  <div class="answer">There are three cases. An idle pause keeps the same sandbox, so auto-resume continues with its workspace. A runtime upgrade creates a new sandbox; RoomTalk migrates the workspace and switches only after success. Published static pages live in separate object storage, so their public URLs remain valid whether the sandbox pauses or is replaced.</div>
 </details>
 
 <details data-lang="zh">
